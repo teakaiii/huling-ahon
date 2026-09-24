@@ -1,0 +1,24 @@
+{% extends "admin/base_site.html" %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+    #site-name a {
+        background-image: url('/static/images/logo.png');
+        background-repeat: no-repeat;
+        background-position: left center;
+        background-size: contain;
+        padding-left: 45px;
+        display: inline-block;
+        height: 40px;
+        line-height: 40px;
+        text-decoration: none;
+    }
+</style>
+{% endblock %}
+
+{% block branding %}
+<h1 id="site-name">
+    <a href="{% url 'admin:index' %}">{{ site_header }}</a>
+</h1>
+{% endblock %}

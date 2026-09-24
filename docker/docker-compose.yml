@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:13
+    container_name: flood_detection_db
+    environment:
+      POSTGRES_DB: ${DB_NAME:-flood_detection}
+      POSTGRES_USER: ${DB_USER:-flood_detection}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-flood_detection_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - flood_detection_network
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ../backend/Django
+      dockerfile: ../../docker/Dockerfile.backend
+    container_name: flood_detection_backend
+    command: gunicorn flood_detection.wsgi:application --bind 0.0.0.0:8000 --workers 3
+    volumes:
+      - ../backend/Django:/app
+      - static_volume:/app/static
+      - media_volume:/app/media
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../backend/Django/.env
+    depends_on:
+      - postgres
+    networks:
+      - flood_detection_network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend/React
+      dockerfile: ../../docker/Dockerfile.frontend
+    container_name: flood_detection_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - flood_detection_network
+    restart: unless-stopped
+
+  redis:
+    image: redis:alpine
+    container_name: flood_detection_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - flood_detection_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  static_volume:
+  media_volume:
+
+networks:
+  flood_detection_network:
+    driver: bridge
