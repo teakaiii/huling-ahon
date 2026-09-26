@@ -52,13 +52,15 @@ export const AuthProvider = ({ children }) => {
       return { success: true }
     } catch (error) {
       console.error('Login error:', error)
-        const detail = error.response?.data?.detail
-        const errorMessage = Array.isArray(detail)
+      const detail = error.response?.data?.detail
+      const errorMessage = !error.response
+        ? 'Cannot connect to the server. Start the Django backend and try again.'
+        : Array.isArray(detail)
           ? detail.join(' ')
           : detail || error.response?.data?.message || 'Invalid username or password.'
       return { 
         success: false, 
-          error: errorMessage
+        error: errorMessage
       }
     }
   }
