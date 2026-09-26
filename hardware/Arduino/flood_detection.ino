@@ -1,567 +1,302 @@
-/*
- * AI-Assisted Flood Detection System - Arduino Firmware
- * Hardware: Arduino Uno + Water Level Sensor + SIM800L GSM/GPRS Module
- * 
- * This firmware:
- * - Reads water level from sensor
- * - Determines flood category (Normal, Alert, Warning, Danger)
- * - Uploads data directly to the Django API via GPRS
- * - Sends SMS alerts during emergency conditions
- * - Handles communication errors with retry logic
- * - Supports solar-powered continuous operation
- */
-
 #include <SoftwareSerial.h>
-#include <ArduinoJson.h>
+#include <avr/pgmspace.h>
 
-// ==================== CONFIGURATION ====================
+SoftwareSerial gsmSerial(7, 8);
 
-// Pin Definitions
-#define WATER_LEVEL_SENSOR_PIN A0
-#define SIM800L_TX_PIN 7
-#define SIM800L_RX_PIN 8
-#define LED_STATUS_PIN 13
-#define BUZZER_PIN 9
+// PINS
+const int SENSOR_PIN = A0;
+const int LED_GREEN  = 13;
+const int LED_YELLOW = 12;
+const int LED_RED    = 11;
 
-// Flood Thresholds (in cm)
-#define NORMAL_THRESHOLD 30
-#define ALERT_THRESHOLD 45
-#define WARNING_THRESHOLD 60
-#define DANGER_THRESHOLD 75
+// CONFIGURATION
+const char RECIPIENT_PHONE[] PROGMEM = "+639077650549";
+const char APN[] PROGMEM = "internet";
 
-// Timing Configuration
-#define READING_INTERVAL 30000      // 30 seconds between readings
-#define UPLOAD_INTERVAL 30000      // 30 seconds between uploads
-#define SMS_COOLDOWN 300000        // 5 minutes between SMS alerts
-#define RETRY_DELAY 5000           // 5 seconds retry delay
-#define MAX_RETRIES 3              // Maximum retry attempts
+// PUBLIC NO-AUTH ENDPOINT NG DJANGO BACKEND
+const char NGROK_URL[] PROGMEM = "http://pretense-landslide-gigahertz.ngrok-free.dev/api/water-level/public-ingest/";
 
-// Django Configuration
-// Replace this with your computer's public URL or LAN IP and port.
-// Example: http://192.168.1.20:8000/api/water-level/public-ingest/
-#define DJANGO_API_URL "http://YOUR_SERVER_ADDRESS:8000/api/water-level/public-ingest/"
+// THRESHOLDS
+const int THRESHOLD_WARNING  = 300;
+const int THRESHOLD_CRITICAL = 450;
 
-// SMS Configuration
-#define ADMIN_NUMBER "+639123456789"  // Admin mobile number
+int currentAlertState = -1;
+bool isGprsConnected = false;
+bool hasSentSMS = false;
+unsigned long lastSmsTime = 0;
+const unsigned long SMS_COOLDOWN = 300000;
 
-// ==================== GLOBAL VARIABLES ====================
-
-SoftwareSerial sim800l(SIM800L_TX_PIN, SIM800L_RX_PIN);
-
-unsigned long lastReadingTime = 0;
-unsigned long lastUploadTime = 0;
-unsigned long lastSMSTime = 0;
-
-float currentWaterLevel = 0.0;
-String currentStatus = "Normal";
-bool sensorOnline = true;
-bool gsmConnected = false;
-bool gprsConnected = false;
-
-// ==================== SETUP ====================
+// TIMING CONTROL
+unsigned long lastHttpPostTime = 0;
+const unsigned long HTTP_POST_INTERVAL = 5000; // 5 seconds
 
 void setup() {
-  // Initialize serial communication
   Serial.begin(9600);
-  while (!Serial);
-  
-  Serial.println(F("========================================"));
-  Serial.println(F("Flood Detection System - Arduino Firmware"));
-  Serial.println(F("========================================"));
-  
-  // Initialize pins
-  pinMode(WATER_LEVEL_SENSOR_PIN, INPUT);
-  pinMode(LED_STATUS_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  
-  // Initialize SIM800L
-  sim800l.begin(9600);
-  
-  // Wait for SIM800L to initialize
-  delay(3000);
-  
-  // Initialize GSM module
-  initializeGSM();
-  
-  // Initialize GPRS
-  initializeGPRS();
-  
-  // Test Django API connection
-  testDjangoConnection();
-  
-  Serial.println(F("System initialized successfully"));
-  Serial.println(F("Starting monitoring loop..."));
-  
-  blinkLED(3, 200);  // Indicate successful startup
-}
+  gsmSerial.begin(9600);
 
-// ==================== MAIN LOOP ====================
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+
+  digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_RED, LOW);
+
+  Serial.println(F("========================================="));
+  Serial.println(F(" AHON-FloodWatch-3 Initializing...     "));
+  Serial.println(F("========================================="));
+
+  delay(2000);
+  initGSM();
+}
 
 void loop() {
-  unsigned long currentTime = millis();
-  
-  // Read water level at specified interval
-  if (currentTime - lastReadingTime >= READING_INTERVAL) {
-    lastReadingTime = currentTime;
-    readWaterLevel();
-  }
-  
-  // Upload to Django at specified interval
-  if (currentTime - lastUploadTime >= UPLOAD_INTERVAL) {
-    lastUploadTime = currentTime;
-    uploadToDjango();
-  }
-  
-  // Check for emergency conditions
-  checkEmergencyConditions();
-  
-  // Handle incoming SMS
-  handleIncomingSMS();
-  
-  // Monitor system health
-  monitorSystemHealth();
-  
-  delay(100);  // Small delay to prevent watchdog issues
-}
+  int waterValue = analogRead(SENSOR_PIN);
 
-// ==================== WATER LEVEL READING ====================
+  Serial.print(F("Current Sensor Value: "));
+  Serial.println(waterValue);
 
-void readWaterLevel() {
-  Serial.println(F("Reading water level..."));
-  
-  // Read analog value from sensor
-  int sensorValue = analogRead(WATER_LEVEL_SENSOR_PIN);
-  
-  // Convert to water level in cm (calibration needed for specific sensor)
-  // This is a generic conversion - adjust based on your sensor
-  currentWaterLevel = map(sensorValue, 0, 1023, 0, 100);
-  
-  // Determine flood status
-  currentStatus = determineFloodStatus(currentWaterLevel);
-  
-  Serial.print(F("Water Level: "));
-  Serial.print(currentWaterLevel);
-  Serial.print(F(" cm - Status: "));
-  Serial.println(currentStatus);
-  
-  // Update LED status
-  updateStatusLED();
-  
-  sensorOnline = true;
-}
+  const char *currentStatus = "Normal";
 
-String determineFloodStatus(float level) {
-  if (level >= DANGER_THRESHOLD) {
-    return "Danger";
-  } else if (level >= WARNING_THRESHOLD) {
-    return "Warning";
-  } else if (level >= ALERT_THRESHOLD) {
-    return "Alert";
-  } else {
-    return "Normal";
-  }
-}
+  // ==========================================
+  // 1. LED LOGIC & SMS ALERTS
+  // ==========================================
+  if (waterValue < THRESHOLD_WARNING) {
+    digitalWrite(LED_GREEN, HIGH);
+    digitalWrite(LED_YELLOW, LOW);
+    digitalWrite(LED_RED, LOW);
+    currentStatus = "Normal";
 
-// ==================== GSM INITIALIZATION ====================
-
-void initializeGSM() {
-  Serial.println(F("Initializing GSM module..."));
-  
-  // Send AT command to check if SIM800L is responding
-  if (sendATCommand("AT", "OK", 2000)) {
-    Serial.println(F("SIM800L is responding"));
-    gsmConnected = true;
-  } else {
-    Serial.println(F("SIM800L not responding"));
-    gsmConnected = false;
-    return;
-  }
-  
-  // Set SMS to text mode
-  sendATCommand("AT+CMGF=1", "OK", 2000);
-  
-  // Disable echo
-  sendATCommand("ATE0", "OK", 2000);
-  
-  // Check SIM card status
-  if (sendATCommand("AT+CPIN?", "READY", 2000)) {
-    Serial.println(F("SIM card ready"));
-  } else {
-    Serial.println(F("SIM card not ready"));
-  }
-  
-  // Check signal strength
-  checkSignalStrength();
-  
-  Serial.println(F("GSM initialization complete"));
-}
-
-void initializeGPRS() {
-  Serial.println(F("Initializing GPRS..."));
-  
-  if (!gsmConnected) {
-    Serial.println(F("GSM not connected, skipping GPRS initialization"));
-    return;
-  }
-  
-  // Attach to GPRS
-  if (sendATCommand("AT+CGATT=1", "OK", 5000)) {
-    Serial.println(F("Attached to GPRS"));
-  } else {
-    Serial.println(F("Failed to attach to GPRS"));
-    gprsConnected = false;
-    return;
-  }
-  
-  // Set APN (adjust for your network provider)
-  sendATCommand("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"", "OK", 2000);
-  sendATCommand("AT+SAPBR=3,1,\"APN\",\"internet.globe.com.ph\"", "OK", 2000);  // Globe Philippines
-  
-  // Open bearer
-  if (sendATCommand("AT+SAPBR=1,1", "OK", 5000)) {
-    Serial.println(F("Bearer opened"));
-    gprsConnected = true;
-  } else {
-    Serial.println(F("Failed to open bearer"));
-    gprsConnected = false;
-  }
-  
-  Serial.println(F("GPRS initialization complete"));
-}
-
-void checkSignalStrength() {
-  sim800l.println("AT+CSQ");
-  delay(1000);
-  
-  if (sim800l.available()) {
-    String response = sim800l.readString();
-    int csqIndex = response.indexOf("+CSQ:");
-    if (csqIndex != -1) {
-      int csq = response.substring(csqIndex + 6, csqIndex + 8).toInt();
-      Serial.print(F("Signal Strength: "));
-      Serial.print(csq);
-      Serial.println(F("/31"));
+    if (currentAlertState != 0) {
+      currentAlertState = 0;
+      Serial.println(F("[STATUS] Normal Level - GREEN LED"));
     }
   }
-}
+  else if (waterValue >= THRESHOLD_WARNING && waterValue < THRESHOLD_CRITICAL) {
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_YELLOW, HIGH);
+    digitalWrite(LED_RED, LOW);
+    currentStatus = "Warning";
 
-// ==================== DJANGO API UPLOAD ====================
-
-void uploadToDjango() {
-  if (!gprsConnected) {
-    Serial.println(F("GPRS not connected, attempting to reconnect..."));
-    initializeGPRS();
-    if (!gprsConnected) {
-      Serial.println(F("Failed to reconnect GPRS, skipping upload"));
-      return;
-    }
-  }
-  
-  Serial.println(F("Uploading to Django API..."));
-  
-  // Create JSON payload
-  StaticJsonDocument<200> doc;
-  doc["water_level_cm"] = currentWaterLevel;
-  doc["status"] = currentStatus;
-  doc["sensor_status"] = sensorOnline ? "online" : "offline";
-  doc["gsm_status"] = gsmConnected ? "connected" : "disconnected";
-  
-  String jsonString;
-  serializeJson(doc, jsonString);
-  
-  // Prepare HTTP request
-  String url = "AT+HTTPPARA=\"URL\",\"" + String(DJANGO_API_URL) + "\"";
-  
-  // Initialize HTTP
-  if (!sendATCommand("AT+HTTPINIT", "OK", 2000)) {
-    Serial.println(F("HTTP initialization failed"));
-    return;
-  }
-  
-  // Set URL
-  if (!sendATCommand(url.c_str(), "OK", 2000)) {
-    Serial.println(F("URL setting failed"));
-    sendATCommand("AT+HTTPTERM", "OK", 2000);
-    return;
-  }
-  
-  // Set content type
-  sendATCommand("AT+HTTPPARA=\"CONTENT\",\"application/json\"", "OK", 2000);
-  
-  // Set data length
-  String dataLengthCmd = "AT+HTTPDATA=" + String(jsonString.length()) + ",5000";
-  sendATCommand(dataLengthCmd.c_str(), "DOWNLOAD", 2000);
-  
-  // Send data
-  sim800l.print(jsonString);
-  delay(1000);
-  
-  // Perform POST request
-  if (sendATCommand("AT+HTTPACTION=1", "OK", 5000)) {
-    delay(5000);
-    
-    // Read response
-    sim800l.println("AT+HTTPREAD");
-    delay(1000);
-    
-    while (sim800l.available()) {
-      Serial.write(sim800l.read());
-    }
-  }
-  
-  // Terminate HTTP
-  sendATCommand("AT+HTTPTERM", "OK", 2000);
-  
-  Serial.println(F("Django upload complete"));
-}
-
-void testDjangoConnection() {
-  Serial.println(F("Testing Django API connection..."));
-  
-  if (!gprsConnected) {
-    Serial.println(F("GPRS not connected, cannot test Django API"));
-    return;
-  }
-  
-  // Simple GET request to test connection
-  String url = "AT+HTTPPARA=\"URL\",\"" + String(DJANGO_API_URL) + "\"";
-  
-  sendATCommand("AT+HTTPINIT", "OK", 2000);
-  sendATCommand(url.c_str(), "OK", 2000);
-  sendATCommand("AT+HTTPPARA=\"CONTENT\",\"application/json\"", "OK", 2000);
-  sendATCommand("AT+HTTPACTION=0", "OK", 5000);
-  delay(5000);
-  sendATCommand("AT+HTTPTERM", "OK", 2000);
-  
-  Serial.println(F("Django API connection test complete"));
-}
-
-// ==================== SMS ALERTS ====================
-
-void checkEmergencyConditions() {
-  unsigned long currentTime = millis();
-  
-  // Check if SMS cooldown has passed
-  if (currentTime - lastSMSTime < SMS_COOLDOWN) {
-    return;
-  }
-  
-  // Send SMS if in Warning or Danger status
-  if (currentStatus == "Warning" || currentStatus == "Danger") {
-    sendEmergencySMS(currentStatus);
-    lastSMSTime = currentTime;
-  }
-}
-
-void sendEmergencySMS(String alertLevel) {
-  Serial.println(F("Sending emergency SMS..."));
-  
-  if (!gsmConnected) {
-    Serial.println(F("GSM not connected, cannot send SMS"));
-    return;
-  }
-  
-  // Create SMS message
-  String message = "BARANGAY TONSUYA FLOOD ";
-  message += alertLevel;
-  message += "\n\nCurrent Flood Level: ";
-  message += alertLevel;
-  message += "\nWater Level: ";
-  message += String(currentWaterLevel);
-  message += " cm\n\n";
-  
-  if (alertLevel == "Danger") {
-    message += "Residents are advised to prepare for immediate evacuation.\n";
-  } else if (alertLevel == "Warning") {
-    message += "Residents are advised to monitor the situation closely.\n";
-  }
-  
-  message += "\nDate: " + getCurrentDate();
-  message += "\nTime: " + getCurrentTime();
-  message += "\n\nPlease stay safe.";
-  
-  // Send SMS to admin
-  sendSMS(ADMIN_NUMBER, message);
-  
-  // Activate buzzer for danger level
-  if (alertLevel == "Danger") {
-    activateBuzzer();
-  }
-}
-
-void sendSMS(String number, String message) {
-  Serial.print(F("Sending SMS to: "));
-  Serial.println(number);
-  
-  // Set recipient
-  String cmd = "AT+CMGS=\"" + number + "\"";
-  sim800l.println(cmd);
-  delay(1000);
-  
-  // Send message
-  sim800l.print(message);
-  delay(100);
-  
-  // Send Ctrl+Z to send
-  sim800l.write(26);
-  delay(5000);
-  
-  Serial.println(F("SMS sent"));
-}
-
-void handleIncomingSMS() {
-  sim800l.println("AT+CMGL=\"ALL\"");
-  delay(1000);
-  
-  while (sim800l.available()) {
-    String response = sim800l.readString();
-    
-    // Check for new SMS
-    if (response.indexOf("+CMGL:") != -1) {
-      // Parse SMS and process commands
-      processSMSCommand(response);
-    }
-  }
-  
-  // Delete all SMS after processing
-  sendATCommand("AT+CMGD=1,4", "OK", 2000);
-}
-
-void processSMSCommand(String sms) {
-  // Check for admin commands
-  if (sms.indexOf("STATUS") != -1) {
-    String statusMsg = "System Status:\n";
-    statusMsg += "Water Level: " + String(currentWaterLevel) + " cm\n";
-    statusMsg += "Status: " + currentStatus + "\n";
-    statusMsg += "Sensor: " + String(sensorOnline ? "Online" : "Offline") + "\n";
-    statusMsg += "GSM: " + String(gsmConnected ? "Connected" : "Disconnected") + "\n";
-    statusMsg += "GPRS: " + String(gprsConnected ? "Connected" : "Disconnected");
-    
-    sendSMS(ADMIN_NUMBER, statusMsg);
-  }
-  else if (sms.indexOf("RESET") != -1) {
-    Serial.println(F("Reset command received"));
-    // Perform system reset
-    asm volatile ("  jmp 0");
-  }
-}
-
-// ==================== SYSTEM MONITORING ====================
-
-void monitorSystemHealth() {
-  static unsigned long lastHealthCheck = 0;
-  unsigned long currentTime = millis();
-  
-  if (currentTime - lastHealthCheck >= 60000) {  // Check every minute
-    lastHealthCheck = currentTime;
-    
-    // Check GSM connection
-    if (!sendATCommand("AT", "OK", 2000)) {
-      Serial.println(F("GSM connection lost, reinitializing..."));
-      gsmConnected = false;
-      gprsConnected = false;
-      initializeGSM();
-      initializeGPRS();
-    }
-    
-    // Check GPRS connection
-    if (gsmConnected && !gprsConnected) {
-      initializeGPRS();
-    }
-  }
-}
-
-// ==================== UTILITY FUNCTIONS ====================
-
-bool sendATCommand(const char* command, const char* expectedResponse, unsigned long timeout) {
-  sim800l.println(command);
-  unsigned long startTime = millis();
-  
-  while (millis() - startTime < timeout) {
-    if (sim800l.available()) {
-      String response = sim800l.readString();
-      if (response.indexOf(expectedResponse) != -1) {
-        return true;
+    if (currentAlertState != 1) {
+      currentAlertState = 1;
+      Serial.println(F("[STATUS] Warning Level - YELLOW LED"));
+      if (!hasSentSMS || millis() - lastSmsTime >= SMS_COOLDOWN) {
+        sendSMS(F("FLOOD WARNING: Water level reached the warning threshold. Monitor the situation and prepare to evacuate if instructed."));
+        lastSmsTime = millis();
+        hasSentSMS = true;
+      } else {
+        Serial.println(F("[SMS] Warning alert skipped during cooldown."));
       }
     }
   }
-  
-  return false;
+  else if (waterValue >= THRESHOLD_CRITICAL) {
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_YELLOW, LOW);
+    digitalWrite(LED_RED, HIGH);
+    currentStatus = "Danger";
+
+    if (currentAlertState != 2) {
+      currentAlertState = 2;
+      Serial.println(F("[STATUS] CRITICAL LEVEL - RED LED! Sending Emergency SMS..."));
+      sendSMS(F("EMERGENCY FLOOD ALERT: High water level detected! Evacuate immediately!"));
+      lastSmsTime = millis();
+      hasSentSMS = true;
+    }
+  }
+
+  // ==========================================
+  // 2. HTTP POST TO DJANGO BACKEND
+  // ==========================================
+  if (millis() - lastHttpPostTime >= HTTP_POST_INTERVAL) {
+    lastHttpPostTime = millis();
+    
+    // Dynamic GSM Status base sa aktwal na GPRS status
+    const char *gsmStatusStr = isGprsConnected ? "connected" : "disconnected";
+
+    String jsonPayload = F("{\"water_level_cm\":");
+    jsonPayload += String(waterValue);
+    jsonPayload += F(",\"status\":\"");
+    jsonPayload += currentStatus;
+    jsonPayload += F("\",\"sensor_status\":\"online\",\"gsm_status\":\"");
+    jsonPayload += gsmStatusStr;
+    jsonPayload += F("\"}");
+
+    Serial.println(F(">>> Sending Live Reading to Django Backend..."));
+    bool uploadSuccess = sendHttpPost(jsonPayload);
+    
+    if (uploadSuccess) {
+      Serial.println(F("[HTTP] Ingest successfully recorded in Django (201/200 OK)!"));
+    } else {
+      Serial.println(F("[HTTP] Upload failed or timed out. Re-checking GPRS connection..."));
+      // Re-check o retry connection kung naputol ang GPRS
+      if (!isGprsConnected) {
+        startGPRS();
+      }
+    }
+  }
+
+  delay(1000);
 }
 
-String getISO8601Time() {
-  // Get current time from NTP server or use system time
-  // For simplicity, using a placeholder - implement NTP for accurate time
-  return "2026-07-13T14:30:00Z";
+// ==========================================
+// GSM & GPRS FUNCTIONS
+// ==========================================
+void initGSM() {
+  Serial.println(F("Initializing GSM Module..."));
+  if (!sendATCommand(F("AT"), F("OK"), 2000)) {
+    Serial.println(F("[GSM] Modem did not respond to AT."));
+    return;
+  }
+  if (!sendATCommand(F("AT+CMGF=1"), F("OK"), 2000)) {
+    Serial.println(F("[GSM] Could not set SMS text mode."));
+  }
+
+  if (!startGPRS()) {
+    Serial.println(F("[GPRS] Setup failed; check SIM registration and TNT APN."));
+  }
+  Serial.println(F("GSM System Initialization Complete."));
 }
 
-String getCurrentDate() {
-  return "2026-07-13";  // Placeholder - implement NTP
+bool startGPRS() {
+  sendATCommand(F("AT+HTTPTERM"), F("OK"), 1000);
+  sendATCommand(F("AT+SAPBR=0,1"), F("OK"), 2000);
+
+  if (!sendATCommand(F("AT+SAPBR=3,1,\"Contype\",\"GPRS\""), F("OK"), 3000)) {
+    Serial.println(F("[GPRS] Failed to set bearer type."));
+    isGprsConnected = false;
+    return false;
+  }
+  String apnCommand = F("AT+SAPBR=3,1,\"APN\",\"");
+  apnCommand += (const __FlashStringHelper *)APN;
+  apnCommand += '"';
+  if (!sendATCommand(apnCommand, F("OK"), 3000)) {
+    Serial.println(F("[GPRS] Failed to set APN."));
+    isGprsConnected = false;
+    return false;
+  }
+
+  Serial.println(F("Opening GPRS Context..."));
+  if (!sendATCommand(F("AT+SAPBR=1,1"), F("OK"), 8000)) {
+    Serial.println(F("GPRS Connection Failed!"));
+    isGprsConnected = false;
+    return false;
+  }
+
+  Serial.println(F("GPRS Connected!"));
+  isGprsConnected = true;
+  return true;
 }
 
-String getCurrentTime() {
-  return "14:30:00";  // Placeholder - implement NTP
-}
+void sendSMS(String message) {
+  if (!sendATCommand(F("AT+CMGF=1"), F("OK"), 2000)) {
+    Serial.println(F("[SMS] Could not set text mode."));
+    return;
+  }
 
-void updateStatusLED() {
-  if (currentStatus == "Danger") {
-    // Fast blinking for danger
-    digitalWrite(LED_STATUS_PIN, HIGH);
-    delay(100);
-    digitalWrite(LED_STATUS_PIN, LOW);
-    delay(100);
-  } else if (currentStatus == "Warning") {
-    // Slow blinking for warning
-    digitalWrite(LED_STATUS_PIN, HIGH);
-    delay(500);
-    digitalWrite(LED_STATUS_PIN, LOW);
-    delay(500);
-  } else if (currentStatus == "Alert") {
-    // On for alert
-    digitalWrite(LED_STATUS_PIN, HIGH);
+  gsmSerial.print("AT+CMGS=\"");
+  gsmSerial.print((const __FlashStringHelper *)RECIPIENT_PHONE);
+  gsmSerial.println(F("\""));
+  String prompt = waitForResponse(F(">"), 10000);
+  if (prompt.indexOf(F(">")) == -1) {
+    Serial.print(F("[SMS] No message prompt from modem: "));
+    Serial.println(prompt);
+    return;
+  }
+
+  gsmSerial.print(message);
+  gsmSerial.write(26); // CTRL+Z
+  String result = waitForResponse(F("OK"), 30000);
+  if (result.indexOf(F("+CMGS:")) != -1 && result.indexOf(F("OK")) != -1) {
+    Serial.println(F(">>> SMS accepted by modem. <<<"));
   } else {
-    // Off for normal
-    digitalWrite(LED_STATUS_PIN, LOW);
+    Serial.print(F("[SMS] Send failed: "));
+    Serial.println(result);
   }
 }
 
-void blinkLED(int count, int delayMs) {
-  for (int i = 0; i < count; i++) {
-    digitalWrite(LED_STATUS_PIN, HIGH);
-    delay(delayMs);
-    digitalWrite(LED_STATUS_PIN, LOW);
-    delay(delayMs);
+bool sendHttpPost(String payload) {
+  if (!sendATCommand(F("AT+HTTPINIT"), F("OK"), 5000)) {
+    Serial.println(F("[HTTP] HTTPINIT failed."));
+    return false;
+  }
+
+  String urlCommand = F("AT+HTTPPARA=\"URL\",\"");
+  urlCommand += (const __FlashStringHelper *)NGROK_URL;
+  urlCommand += '"';
+  if (!sendATCommand(F("AT+HTTPPARA=\"CID\",1"), F("OK"), 3000) ||
+      !sendATCommand(urlCommand, F("OK"), 3000) ||
+      !sendATCommand(F("AT+HTTPPARA=\"CONTENT\",\"application/json\""), F("OK"), 3000) ||
+      !sendATCommand(F("AT+HTTPPARA=\"USERDATA\",\"ngrok-skip-browser-warning: true\""), F("OK"), 3000)) {
+    Serial.println(F("[HTTP] Failed to configure request parameters."));
+    sendATCommand(F("AT+HTTPTERM"), F("OK"), 2000);
+    return false;
+  }
+
+  String dataCmd = String(F("AT+HTTPDATA=")) + String(payload.length()) + F(",5000");
+  if (!sendATCommand(dataCmd, F("DOWNLOAD"), 5000)) {
+    Serial.println(F("[HTTP] Modem did not accept HTTPDATA."));
+    sendATCommand(F("AT+HTTPTERM"), F("OK"), 1000);
+    return false;
+  }
+  gsmSerial.print(payload);
+  String dataResponse = waitForResponse(F("OK"), 10000);
+  if (dataResponse.indexOf(F("OK")) == -1 || dataResponse.indexOf(F("ERROR")) != -1) {
+    Serial.print(F("[HTTP] Payload was not accepted: "));
+    Serial.println(dataResponse);
+    sendATCommand(F("AT+HTTPTERM"), F("OK"), 1000);
+    return false;
+  }
+
+  // HTTPACTION returns its status asynchronously after the immediate OK.
+  gsmSerial.println("AT+HTTPACTION=1");
+  String actionResponse = waitForResponse(F("+HTTPACTION:"), 30000);
+  sendATCommand(F("AT+HTTPTERM"), F("OK"), 2000);
+
+  if (actionResponse.indexOf(F(",200,")) != -1 || actionResponse.indexOf(F(",201,")) != -1) {
+    isGprsConnected = true;
+    return true;
+  } else {
+    Serial.print(F("[HTTP ERROR] No successful HTTP result: "));
+    Serial.println(actionResponse);
+    if (actionResponse.indexOf(F("+HTTPACTION:")) == -1 ||
+      actionResponse.indexOf(F(",601,")) != -1 ||
+      actionResponse.indexOf(F(",602,")) != -1) {
+      isGprsConnected = false;
+    }
+    return false;
   }
 }
 
-void activateBuzzer() {
-  Serial.println(F("Activating buzzer..."));
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(200);
-    digitalWrite(BUZZER_PIN, LOW);
-    delay(200);
+bool sendATCommand(String command, String expectedResponse, unsigned long timeout) {
+  gsmSerial.println(command);
+  String resp = waitForResponse(expectedResponse, timeout);
+  bool succeeded = resp.indexOf(expectedResponse) != -1 && resp.indexOf("ERROR") == -1;
+  if (!succeeded) {
+    Serial.print(F("[MODEM] Command failed: "));
+    Serial.print(command);
+    Serial.print(F(" | response: "));
+    Serial.println(resp);
   }
+  return succeeded;
 }
 
-// ==================== ERROR HANDLING ====================
+String waitForResponse(String expectedResponse, unsigned long timeout) {
+  String response;
+  unsigned long startTime = millis();
 
-void handleError(String error) {
-  Serial.print(F("ERROR: "));
-  Serial.println(error);
-  
-  // Blink LED to indicate error
-  for (int i = 0; i < 10; i++) {
-    digitalWrite(LED_STATUS_PIN, HIGH);
-    delay(100);
-    digitalWrite(LED_STATUS_PIN, LOW);
-    delay(100);
+  while (millis() - startTime < timeout) {
+    while (gsmSerial.available()) {
+      char c = gsmSerial.read();
+      response += c;
+    }
+    if (expectedResponse.length() > 0 && response.indexOf(expectedResponse) != -1) {
+      break;
+    }
+    if (response.indexOf(F("ERROR")) != -1) {
+      break;
+    }
+    delay(1);
   }
-  
-  // Attempt recovery
-  if (error.indexOf("GSM") != -1) {
-    initializeGSM();
-  } else if (error.indexOf("GPRS") != -1) {
-    initializeGPRS();
-  }
+  return response;
 }
