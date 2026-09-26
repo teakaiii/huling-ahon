@@ -17,8 +17,11 @@ const char APN[] PROGMEM = "internet";
 const char NGROK_URL[] PROGMEM = "http://pretense-landslide-gigahertz.ngrok-free.dev/api/water-level/public-ingest/";
 
 // THRESHOLDS
+// NOTE: I-verify muli gamit ang Serial Monitor ang aktwal na max reading ng sensor
+// bago tanggapin ang mga values na ito. Sa lumang working code, 550 ang CRITICAL
+// (base sa max reading na ~600-602). Baguhin kung iba na ang kalibrasyon ngayon.
 const int THRESHOLD_WARNING  = 300;
-const int THRESHOLD_CRITICAL = 450;
+const int THRESHOLD_CRITICAL = 500;
 
 int currentAlertState = -1;
 bool isGprsConnected = false;
@@ -57,6 +60,7 @@ void loop() {
   Serial.println(waterValue);
 
   const char *currentStatus = "Normal";
+  bool isCritical = false;
 
   // ==========================================
   // 1. LED LOGIC & SMS ALERTS
@@ -95,10 +99,14 @@ void loop() {
     digitalWrite(LED_YELLOW, LOW);
     digitalWrite(LED_RED, HIGH);
     currentStatus = "Danger";
+    isCritical = true;
 
     if (currentAlertState != 2) {
       currentAlertState = 2;
       Serial.println(F("[STATUS] CRITICAL LEVEL - RED LED! Sending Emergency SMS..."));
+      // FIX: flush any stray bytes sitting in the GSM serial buffer (e.g. leftover
+      // HTTP response data) before issuing the SMS command sequence.
+      flushGsmSerial();
       sendSMS(F("EMERGENCY FLOOD ALERT: High water level detected! Evacuate immediately!"));
       lastSmsTime = millis();
       hasSentSMS = true;
@@ -108,13 +116,22 @@ void loop() {
   // ==========================================
   // 2. HTTP POST TO DJANGO BACKEND
   // ==========================================
-  if (millis() - lastHttpPostTime >= HTTP_POST_INTERVAL) {
+  // FIX: skip the HTTP POST this cycle if we just handled a fresh CRITICAL
+  // transition above, so the SMS command isn't delayed/blocked by an HTTP
+  // transaction that can take several seconds to complete.
+  if (!isCritical && (millis() - lastHttpPostTime >= HTTP_POST_INTERVAL)) {
     lastHttpPostTime = millis();
-    
-    // Dynamic GSM Status base sa aktwal na GPRS status
+
     const char *gsmStatusStr = isGprsConnected ? "connected" : "disconnected";
 
-    String jsonPayload = F("{\"water_level_cm\":");
+    // FIX: reserve buffer up front to reduce heap fragmentation risk on the
+    // limited RAM of an Uno/Nano when doing repeated String concatenation.
+    String jsonPayload;
+    jsonPayload.reserve(160);
+
+    // FIX: removed the stray leading "{" that was producing invalid JSON
+    // like {{"water_level_cm":...}  (double open-brace, single close-brace).
+    jsonPayload += F("{\"water_level_cm\":");
     jsonPayload += String(waterValue);
     jsonPayload += F(",\"status\":\"");
     jsonPayload += currentStatus;
@@ -123,13 +140,15 @@ void loop() {
     jsonPayload += F("\"}");
 
     Serial.println(F(">>> Sending Live Reading to Django Backend..."));
+    Serial.print(F("[DEBUG] Payload: "));
+    Serial.println(jsonPayload);
+
     bool uploadSuccess = sendHttpPost(jsonPayload);
-    
+
     if (uploadSuccess) {
       Serial.println(F("[HTTP] Ingest successfully recorded in Django (201/200 OK)!"));
     } else {
       Serial.println(F("[HTTP] Upload failed or timed out. Re-checking GPRS connection..."));
-      // Re-check o retry connection kung naputol ang GPRS
       if (!isGprsConnected) {
         startGPRS();
       }
@@ -142,6 +161,12 @@ void loop() {
 // ==========================================
 // GSM & GPRS FUNCTIONS
 // ==========================================
+void flushGsmSerial() {
+  while (gsmSerial.available()) {
+    gsmSerial.read();
+  }
+}
+
 void initGSM() {
   Serial.println(F("Initializing GSM Module..."));
   if (!sendATCommand(F("AT"), F("OK"), 2000)) {
@@ -167,7 +192,9 @@ bool startGPRS() {
     isGprsConnected = false;
     return false;
   }
-  String apnCommand = F("AT+SAPBR=3,1,\"APN\",\"");
+  String apnCommand;
+  apnCommand.reserve(48);
+  apnCommand = F("AT+SAPBR=3,1,\"APN\",\"");
   apnCommand += (const __FlashStringHelper *)APN;
   apnCommand += '"';
   if (!sendATCommand(apnCommand, F("OK"), 3000)) {
@@ -188,17 +215,19 @@ bool startGPRS() {
   return true;
 }
 
-void sendSMS(String message) {
+void sendSMS(const __FlashStringHelper *message) {
+  flushGsmSerial();
+
   if (!sendATCommand(F("AT+CMGF=1"), F("OK"), 2000)) {
     Serial.println(F("[SMS] Could not set text mode."));
     return;
   }
 
-  gsmSerial.print("AT+CMGS=\"");
+  gsmSerial.print(F("AT+CMGS=\""));
   gsmSerial.print((const __FlashStringHelper *)RECIPIENT_PHONE);
   gsmSerial.println(F("\""));
   String prompt = waitForResponse(F(">"), 10000);
-  if (prompt.indexOf(F(">")) == -1) {
+  if (prompt.indexOf('>') == -1) {
     Serial.print(F("[SMS] No message prompt from modem: "));
     Serial.println(prompt);
     return;
@@ -215,13 +244,15 @@ void sendSMS(String message) {
   }
 }
 
-bool sendHttpPost(String payload) {
+bool sendHttpPost(const String &payload) {
   if (!sendATCommand(F("AT+HTTPINIT"), F("OK"), 5000)) {
     Serial.println(F("[HTTP] HTTPINIT failed."));
     return false;
   }
 
-  String urlCommand = F("AT+HTTPPARA=\"URL\",\"");
+  String urlCommand;
+  urlCommand.reserve(140);
+  urlCommand = F("AT+HTTPPARA=\"URL\",\"");
   urlCommand += (const __FlashStringHelper *)NGROK_URL;
   urlCommand += '"';
   if (!sendATCommand(F("AT+HTTPPARA=\"CID\",1"), F("OK"), 3000) ||
@@ -233,7 +264,9 @@ bool sendHttpPost(String payload) {
     return false;
   }
 
-  String dataCmd = String(F("AT+HTTPDATA=")) + String(payload.length()) + F(",5000");
+  String dataCmd;
+  dataCmd.reserve(32);
+  dataCmd = String(F("AT+HTTPDATA=")) + String(payload.length()) + F(",5000");
   if (!sendATCommand(dataCmd, F("DOWNLOAD"), 5000)) {
     Serial.println(F("[HTTP] Modem did not accept HTTPDATA."));
     sendATCommand(F("AT+HTTPTERM"), F("OK"), 1000);
@@ -249,7 +282,7 @@ bool sendHttpPost(String payload) {
   }
 
   // HTTPACTION returns its status asynchronously after the immediate OK.
-  gsmSerial.println("AT+HTTPACTION=1");
+  gsmSerial.println(F("AT+HTTPACTION=1"));
   String actionResponse = waitForResponse(F("+HTTPACTION:"), 30000);
   sendATCommand(F("AT+HTTPTERM"), F("OK"), 2000);
 
@@ -268,10 +301,17 @@ bool sendHttpPost(String payload) {
   }
 }
 
-bool sendATCommand(String command, String expectedResponse, unsigned long timeout) {
+bool sendATCommand(const String &command, const String &expectedResponse, unsigned long timeout) {
+  // FIX: drain any leftover/stale bytes still sitting in the buffer from the
+  // previous exchange BEFORE sending a new command. Without this, trailing
+  // bytes from the last response bleed into the next read and corrupt/garble
+  // the text (e.g. "operation not ؽݕRh%I<0,1" — a mix of old + new data).
+  flushGsmSerial();
+  delay(50); // small settle time so the module is ready for a new command
+
   gsmSerial.println(command);
   String resp = waitForResponse(expectedResponse, timeout);
-  bool succeeded = resp.indexOf(expectedResponse) != -1 && resp.indexOf("ERROR") == -1;
+  bool succeeded = resp.indexOf(expectedResponse) != -1 && resp.indexOf(F("ERROR")) == -1;
   if (!succeeded) {
     Serial.print(F("[MODEM] Command failed: "));
     Serial.print(command);
@@ -281,19 +321,32 @@ bool sendATCommand(String command, String expectedResponse, unsigned long timeou
   return succeeded;
 }
 
-String waitForResponse(String expectedResponse, unsigned long timeout) {
+String waitForResponse(const String &expectedResponse, unsigned long timeout) {
   String response;
+  response.reserve(96); // FIX: cap growth tendency on repeated appends
   unsigned long startTime = millis();
+  unsigned long lastByteTime = millis();
+  bool foundToken = false;
 
   while (millis() - startTime < timeout) {
     while (gsmSerial.available()) {
       char c = gsmSerial.read();
       response += c;
+      lastByteTime = millis();
     }
-    if (expectedResponse.length() > 0 && response.indexOf(expectedResponse) != -1) {
-      break;
+    if (!foundToken) {
+      if (expectedResponse.length() > 0 && response.indexOf(expectedResponse) != -1) {
+        foundToken = true;
+      }
+      if (response.indexOf(F("ERROR")) != -1) {
+        foundToken = true;
+      }
     }
-    if (response.indexOf(F("ERROR")) != -1) {
+    // FIX: once the expected token/ERROR is seen, don't return immediately —
+    // keep draining for a short "settle" window (30ms of silence) so any
+    // trailing bytes (extra CR/LF, etc.) are fully consumed now instead of
+    // leaking into the NEXT command's response and corrupting it.
+    if (foundToken && (millis() - lastByteTime > 30)) {
       break;
     }
     delay(1);
